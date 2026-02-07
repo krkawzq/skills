@@ -1,0 +1,58 @@
+# Article Translator Configuration
+# This file configures the high-concurrency translation script
+
+api:
+  # OpenAI-compatible API endpoint (customize for your provider)
+  base_url: "https://api.vectorengine.ai/v1"
+
+  # API key - can also be set via OPENAI_API_KEY environment variable
+  # If both are set, environment variable takes precedence
+  api_key: "sk-vNLWDcgvB8tYoPCSLR4T7JseS7EoIlE7FJN5iCZeSuAZkShs"
+
+  # Model to use for translation
+  # Examples: "gpt-4", "gpt-3.5-turbo", "claude-3-opus-20240229"
+  model: "deepseek-v3.2"
+
+translation:
+  # Number of concurrent API requests (default: 100)
+  # Adjust based on your API rate limits
+  concurrency: 100
+
+  # Request timeout in seconds
+  timeout: 60
+
+  # Maximum number of retries for failed requests
+  max_retries: 3
+
+  # Initial retry delay in seconds (uses exponential backoff)
+  retry_delay: 1
+
+  # Target language (default: Chinese)
+  target_language: "Chinese"
+
+  # Validation-retry loop settings
+  # Enable iterative validation with AI feedback (default: true)
+  enable_iterative_validation: true
+
+  # Maximum validation iterations per chunk (default: 3)
+  # The AI will retry up to this many times with validation feedback
+  max_validation_iterations: 5
+
+# System prompt for translation
+# This instructs the model on how to translate
+system_prompt: |
+  You are translating an academic paper from English to {target_language}.
+
+  CRITICAL RULES:
+  1. LaTeX formulas: Preserve the mathematical content, but FIX formatting issues:
+     - Remove extra spaces inside formulas (e.g., "$ x ^ 2 $" → "$x^2$")
+     - Use correct LaTeX syntax (e.g., "\int" not "∫", "\times" not "×")
+     - Keep inline math with single $ and display math with $$
+     - Examples: $x^2$, $\int f(x)dx$, $$\sum_{{i=1}}^n x_i$$
+  2. Preserve all code blocks exactly as-is
+  3. Preserve all links and image paths exactly as-is
+  4. Do NOT add blank lines within paragraphs
+  5. Translate naturally while maintaining technical accuracy
+  6. Keep technical terms in English when appropriate
+
+  Output ONLY the translated text, nothing else.
