@@ -17,24 +17,14 @@ import argparse
 import asyncio
 import aiohttp
 import json
-import os
-import re
 import sys
 from pathlib import Path
 from typing import Dict, List
-import yaml
 
-
-def load_config(config_path: str) -> Dict:
-    """Load configuration from YAML file"""
-    with open(config_path, 'r', encoding='utf-8') as f:
-        config = yaml.safe_load(f)
-    env_key = os.environ.get('OPENAI_API_KEY')
-    if env_key:
-        config['api']['api_key'] = env_key
-    if not config['api'].get('api_key'):
-        raise ValueError("API key not set. Set it in config.yaml or OPENAI_API_KEY environment variable")
-    return config
+# Import from shared modules
+from shared import load_config, source_md_is_safe, sanitize_target_md
+from prompts import build_retry_system_prompt, build_retry_user_prompt, format_errors_for_ai
+from response_parser import parse_translation_response
 
 
 def load_failed_chunks(failed_chunks_path: str) -> List[Dict]:
@@ -69,42 +59,6 @@ def format_validation_history(history: List[Dict]) -> str:
     return "\n".join(lines)
 
 
-def sanitize_target_md(text: str) -> str:
-    """Remove block openers and blank lines to satisfy paragraph-only constraints."""
-    lines = text.replace("\r\n", "\n").split("\n")
-    cleaned: List[str] = []
-    for ln in lines:
-        stripped = ln.lstrip()
-        if stripped.startswith("```") or stripped.startswith("~~~"):
-            continue
-        if ln.strip() in ("$$", r"\[", r"\]"):
-            continue
-        if stripped.startswith("#"):
-            # heading marker
-            continue
-        if ln.strip() == "":
-            continue
-        cleaned.append(ln.strip())
-    return "\n".join(cleaned).strip()
-
-
-def source_md_is_safe(text: str) -> bool:
-    if not isinstance(text, str):
-        return False
-    if re.search(r"\n\s*\n", text.replace("\r\n", "\n").strip()):
-        return False
-    heading_line_re = re.compile(r"^\s*#{1,6}\s+")
-    for ln in text.replace("\r\n", "\n").split("\n"):
-        stripped = ln.lstrip()
-        if stripped.startswith("```") or stripped.startswith("~~~"):
-            return False
-        if ln.strip() in ("$$", r"\["):
-            return False
-        if heading_line_re.match(ln):
-            return False
-    return True
-
-
 async def translate_with_detailed_prompt(
     session: aiohttp.ClientSession,
     chunk: Dict,
@@ -124,47 +78,17 @@ async def translate_with_detailed_prompt(
         if entry['result'].get('errors'):
             all_errors.extend(entry['result']['errors'])
 
-    # Deduplicate errors by type
-    error_types = {}
-    for error in all_errors:
-        error_type = error.get('type', 'UNKNOWN')
-        if error_type not in error_types:
-            error_types[error_type] = error
+    # Use prompts module to build prompts
+    system_prompt = build_retry_system_prompt(
+        target_language=config['translation']['target_language'],
+        enable_source_correction=config.get('translation', {}).get('enable_source_correction', False),
+        enable_math_fixing=config.get('translation', {}).get('enable_math_fixing', True),
+        guidance_prompt=None,
+    )
 
-    error_summary = []
-    for error_type, error in error_types.items():
-        error_summary.append(f"- {error_type}: {error.get('message', 'No message')}")
-        if error.get('suggestion'):
-            error_summary.append(f"  Suggestion: {error['suggestion']}")
-        if error.get('original_math'):
-            error_summary.append(f"  Original math: {error['original_math']}")
-        if error.get('original_links'):
-            error_summary.append(f"  Original links: {error['original_links']}")
-
-    system_prompt = f"""You are translating an academic paper from English to {config['translation']['target_language']}.
-
-This chunk has FAILED validation {len(validation_history)} times. Please analyze the errors carefully and provide a correct translation.
-
-CRITICAL RULES:
-1. Preserve ALL LaTeX formulas EXACTLY as-is (e.g., $x^2$, $$\\int f(x)dx$$)
-2. Preserve ALL code blocks EXACTLY as-is
-3. Preserve ALL links and URLs EXACTLY as-is (only translate link text, not destinations)
-4. Do NOT add blank lines within paragraphs
-5. Do NOT introduce headings (#), code fences (```), or math fences ($$)
-6. Translate naturally while maintaining technical accuracy
-
-Output ONLY the translated text, nothing else."""
-
-    user_prompt = f"""ORIGINAL TEXT:
-{chunk['source_md']}
-
-PREVIOUS VALIDATION ERRORS:
-{chr(10).join(error_summary)}
-
-VALIDATION HISTORY:
-{format_validation_history(validation_history)}
-
-Please provide a corrected translation that addresses ALL the errors above."""
+    user_prompt = build_retry_user_prompt(chunk['source_md'], all_errors)
+    user_prompt += "\n\nVALIDATION HISTORY:\n" + format_validation_history(validation_history)
+    user_prompt += "\n\nThis chunk has FAILED validation multiple times. Please analyze carefully."
 
     payload = {
         "model": config['api']['model'],
@@ -180,7 +104,13 @@ Please provide a corrected translation that addresses ALL the errors above."""
     async with session.post(url, json=payload, headers=headers, timeout=timeout) as response:
         if response.status == 200:
             data = await response.json()
-            return data['choices'][0]['message']['content'].strip()
+            raw = data['choices'][0]['message']['content']
+            # Parse response
+            parsed = parse_translation_response(raw)
+            if parsed.translated_md:
+                return parsed.translated_md
+            # Fallback to raw response
+            return raw
         else:
             error_text = await response.text()
             raise Exception(f"API error {response.status}: {error_text}")
@@ -234,7 +164,7 @@ async def process_failed_chunk(
         else:
             error_types = [e.get('type') for e in validation_result.get('errors', [])]
             if any(t in ("BLOCK_STRUCTURE", "BLANK_LINES") for t in error_types):
-                # Try a sanitization pass to remove disallowed block openers/blank lines.
+                # Try sanitization
                 entry["target_md"] = sanitize_target_md(entry["target_md"])
                 validation_result = validate_entry_json(entry, scripts_dir, chunks_path)
                 if validation_result['valid']:
@@ -297,26 +227,10 @@ def main():
     parser = argparse.ArgumentParser(
         description="Handle chunks that failed all validation iterations"
     )
-    parser.add_argument(
-        "--failed-chunks",
-        required=True,
-        help="Path to failed_chunks.json file"
-    )
-    parser.add_argument(
-        "--chunks",
-        required=True,
-        help="Path to chunks.jsonl file"
-    )
-    parser.add_argument(
-        "--output",
-        required=True,
-        help="Path to output translations.jsonl file"
-    )
-    parser.add_argument(
-        "--config",
-        required=True,
-        help="Path to config.yaml file"
-    )
+    parser.add_argument("--failed-chunks", required=True, help="Path to failed_chunks.json file")
+    parser.add_argument("--chunks", required=True, help="Path to chunks.jsonl file")
+    parser.add_argument("--output", required=True, help="Path to output translations.jsonl file")
+    parser.add_argument("--config", required=True, help="Path to config.yaml file")
 
     args = parser.parse_args()
 
@@ -384,3 +298,5 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+

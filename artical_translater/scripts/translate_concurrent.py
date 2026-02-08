@@ -18,20 +18,24 @@ Features:
 - Real-time progress tracking
 - Validation and append in real-time
 - Works with any OpenAI-compatible API
+- Structured AI output with meta-info
+- Main agent guidance support
 """
 
 import asyncio
 import aiohttp
 import json
-import os
-import re
 import sys
 import argparse
 import time
 from pathlib import Path
-from typing import Dict, List, Optional, Set
-import yaml
+from typing import Dict, List, Optional
 from tqdm.asyncio import tqdm
+
+# Import new modules
+from shared import load_config, source_md_is_safe, load_chunks, load_existing_translations, sanitize_target_md
+from prompts import build_system_prompt, build_retry_system_prompt, build_retry_user_prompt, build_user_prompt, format_errors_for_ai
+from response_parser import parse_translation_response, TranslationResponse
 
 
 class TranslationError(Exception):
@@ -54,70 +58,38 @@ class RetryExhausted(TranslationError):
     pass
 
 
-def load_config(config_path: str) -> Dict:
-    """Load configuration from YAML file"""
-    with open(config_path, 'r', encoding='utf-8') as f:
-        config = yaml.safe_load(f)
-
-    # Override API key from environment if set
-    env_key = os.environ.get('OPENAI_API_KEY')
-    if env_key:
-        config['api']['api_key'] = env_key
-
-    # Validate required fields
-    if not config['api']['api_key']:
-        raise ValueError("API key not set. Set it in config.yaml or OPENAI_API_KEY environment variable")
-
-    return config
-
-
-def load_chunks(chunks_path: str) -> List[Dict]:
-    """Load chunks from JSONL file"""
-    chunks = []
-    with open(chunks_path, 'r', encoding='utf-8') as f:
-        for line in f:
-            if line.strip():
-                chunks.append(json.loads(line))
-    return chunks
-
-
-def load_existing_translations(output_path: str) -> Set[str]:
-    """Load already-translated chunk IDs from output file"""
-    if not os.path.exists(output_path):
-        return set()
-
-    translated_ids = set()
-    with open(output_path, 'r', encoding='utf-8') as f:
-        for line in f:
-            if line.strip():
-                entry = json.loads(line)
-                translated_ids.add(entry['chunk_id'])
-
-    return translated_ids
-
-
 async def call_translation_api(
     session: aiohttp.ClientSession,
     chunk: Dict,
-    config: Dict
+    config: Dict,
+    guidance_prompt: Optional[str] = None
 ) -> str:
-    """Make async API call to translate one chunk"""
+    """Make async API call to translate one chunk with structured output."""
     url = f"{config['api']['base_url']}/chat/completions"
     headers = {
         "Authorization": f"Bearer {config['api']['api_key']}",
         "Content-Type": "application/json"
     }
 
-    # Format system prompt with target language
-    system_prompt = config['system_prompt'].format(
-        target_language=config['translation']['target_language']
+    # Build system prompt using prompts module
+    enable_source_correction = config.get('translation', {}).get('enable_source_correction', False)
+    enable_math_fixing = config.get('translation', {}).get('enable_math_fixing', True)
+    target_language = config['translation']['target_language']
+
+    system_prompt = build_system_prompt(
+        target_language=target_language,
+        enable_source_correction=enable_source_correction,
+        enable_math_fixing=enable_math_fixing,
+        guidance_prompt=guidance_prompt,
     )
+
+    user_prompt = build_user_prompt(chunk['source_md'])
 
     payload = {
         "model": config['api']['model'],
         "messages": [
             {"role": "system", "content": system_prompt},
-            {"role": "user", "content": f"Translate this paragraph:\n\n{chunk['source_md']}"}
+            {"role": "user", "content": user_prompt}
         ],
         "temperature": 0.3
     }
@@ -128,7 +100,8 @@ async def call_translation_api(
         async with session.post(url, json=payload, headers=headers, timeout=timeout) as response:
             if response.status == 200:
                 data = await response.json()
-                return data['choices'][0]['message']['content'].strip()
+                # Return raw response (not stripped) for parsing
+                return data['choices'][0]['message']['content']
             elif response.status == 429:
                 # Rate limit - will be retried
                 raise RateLimitError(f"Rate limit hit for chunk {chunk['chunk_id']}")
@@ -147,7 +120,7 @@ async def call_translation_api_with_custom_prompt(
     user_prompt: str,
     config: Dict
 ) -> str:
-    """Make async API call with custom prompts (for retry with feedback)"""
+    """Make async API call with custom prompts (for retry with feedback)."""
     url = f"{config['api']['base_url']}/chat/completions"
     headers = {
         "Authorization": f"Bearer {config['api']['api_key']}",
@@ -169,7 +142,7 @@ async def call_translation_api_with_custom_prompt(
         async with session.post(url, json=payload, headers=headers, timeout=timeout) as response:
             if response.status == 200:
                 data = await response.json()
-                return data['choices'][0]['message']['content'].strip()
+                return data['choices'][0]['message']['content']
             elif response.status == 429:
                 raise RateLimitError("Rate limit hit")
             else:
@@ -187,7 +160,8 @@ async def call_translation_with_retries(
     config: Dict,
     *,
     system_prompt: Optional[str] = None,
-    user_prompt: Optional[str] = None
+    user_prompt: Optional[str] = None,
+    guidance_prompt: Optional[str] = None
 ) -> str:
     """Call translation API with retry + exponential backoff (config-driven)."""
     max_retries = config.get('translation', {}).get('max_retries', 3)
@@ -197,7 +171,7 @@ async def call_translation_with_retries(
     while True:
         try:
             if system_prompt is None or user_prompt is None:
-                return await call_translation_api(session, chunk, config)
+                return await call_translation_api(session, chunk, config, guidance_prompt)
             return await call_translation_api_with_custom_prompt(
                 session, system_prompt, user_prompt, config
             )
@@ -216,15 +190,17 @@ async def translate_chunk_with_validation_loop(
     semaphore: asyncio.Semaphore,
     chunks_path: str,
     scripts_dir: Path,
-    max_iterations: int = 3
+    max_iterations: int = 3,
+    guidance_prompt: Optional[str] = None
 ) -> tuple:
     """
     Translate a chunk with iterative validation-retry loop.
 
     Returns:
-        (entry, validation_history) where:
+        (entry, validation_history, parsed) where:
         - entry: Final translation entry (None if all attempts failed)
         - validation_history: List of validation results for each attempt
+        - parsed: TranslationResponse object (None if failed)
     """
     validation_history = []
     previous_errors = []
@@ -235,11 +211,24 @@ async def translate_chunk_with_validation_loop(
                 # Attempt translation
                 if iteration == 1:
                     # Initial translation
-                    target_md = await call_translation_with_retries(session, chunk, config)
+                    raw_response = await call_translation_with_retries(
+                        session, chunk, config, guidance_prompt=guidance_prompt
+                    )
                 else:
                     # Retry with validation feedback
-                    system_prompt, user_prompt = create_retry_prompt(chunk, config, previous_errors)
-                    target_md = await call_translation_with_retries(
+                    enable_source_correction = config.get('translation', {}).get('enable_source_correction', False)
+                    enable_math_fixing = config.get('translation', {}).get('enable_math_fixing', True)
+                    target_language = config['translation']['target_language']
+
+                    system_prompt = build_retry_system_prompt(
+                        target_language=target_language,
+                        enable_source_correction=enable_source_correction,
+                        enable_math_fixing=enable_math_fixing,
+                        guidance_prompt=guidance_prompt,
+                    )
+                    user_prompt = build_retry_user_prompt(chunk['source_md'], previous_errors)
+
+                    raw_response = await call_translation_with_retries(
                         session,
                         chunk,
                         config,
@@ -247,12 +236,32 @@ async def translate_chunk_with_validation_loop(
                         user_prompt=user_prompt
                     )
 
+                # Parse response
+                parsed = parse_translation_response(raw_response)
+
+                if parsed.translated_md is None:
+                    # Parse failed, record error, continue to retry
+                    validation_history.append({
+                        "iteration": iteration,
+                        "result": {
+                            "status": "parse_error",
+                            "valid": False,
+                            "errors": [{"type": "PARSE_ERROR", "message": str(parsed.parse_errors)}],
+                            "warnings": []
+                        }
+                    })
+                    continue
+
                 # Create entry
                 entry = {
                     "chunk_id": chunk['chunk_id'],
-                    "target_md": target_md
+                    "target_md": parsed.translated_md,
                 }
-                if source_md_is_safe(chunk.get('source_md', '')):
+
+                # If has corrected source, use it
+                if parsed.corrected_source_md:
+                    entry["source_md"] = parsed.corrected_source_md
+                elif source_md_is_safe(chunk.get('source_md', '')):
                     entry["source_md"] = chunk['source_md']
 
                 # Validate with JSON output
@@ -264,7 +273,17 @@ async def translate_chunk_with_validation_loop(
 
                 if validation_result['valid']:
                     # Success!
-                    return (entry, validation_history)
+                    return (entry, validation_history, parsed)
+
+                # Check CHECKER_BYPASS
+                if parsed.checker_bypass and parsed.checker_bypass.lower() != "none":
+                    # Try sanitize
+                    entry["target_md"] = sanitize_target_md(entry["target_md"])
+                    validation_result = validate_entry_json(entry, scripts_dir, chunks_path)
+                    if validation_result['valid']:
+                        return (entry, validation_history, parsed)
+                    # Sanitize failed, but don't retry
+                    return (entry, validation_history, parsed)
 
                 # Failed - prepare feedback for next iteration
                 previous_errors = validation_result['errors']
@@ -276,11 +295,7 @@ async def translate_chunk_with_validation_loop(
                     "result": {
                         "status": "error",
                         "valid": False,
-                        "errors": [{
-                            "type": "API_ERROR",
-                            "message": str(e),
-                            "suggestion": "Retry the translation"
-                        }],
+                        "errors": [{"type": "API_ERROR", "message": str(e), "suggestion": "Retry the translation"}],
                         "warnings": []
                     }
                 })
@@ -288,56 +303,11 @@ async def translate_chunk_with_validation_loop(
                 continue
 
     # All iterations exhausted
-    return (None, validation_history)
-
-
-async def translate_chunk_with_retry(
-    session: aiohttp.ClientSession,
-    chunk: Dict,
-    config: Dict,
-    semaphore: asyncio.Semaphore
-) -> Dict:
-    """Translate a chunk with config-driven retry logic"""
-    async with semaphore:
-        target_md = await call_translation_with_retries(session, chunk, config)
-
-    entry = {
-        "chunk_id": chunk['chunk_id'],
-        "target_md": target_md
-    }
-    if source_md_is_safe(chunk.get('source_md', '')):
-        entry["source_md"] = chunk['source_md']
-
-    return entry
-
-
-def validate_entry(entry: Dict, scripts_dir: Path, chunks_path: str) -> bool:
-    """Validate translation entry using check_translation_entry.py"""
-    import subprocess
-
-    # Write entry to temp file
-    temp_file = scripts_dir.parent / "work" / f"temp_{entry['chunk_id']}.json"
-    temp_file.parent.mkdir(exist_ok=True)
-
-    with open(temp_file, 'w', encoding='utf-8') as f:
-        json.dump(entry, f, ensure_ascii=False, indent=2)
-
-    # Run validation script with chunks parameter
-    check_script = scripts_dir / "check_translation_entry.py"
-    result = subprocess.run(
-        [sys.executable, str(check_script), "--in", str(temp_file), "--chunks", chunks_path],
-        capture_output=True,
-        text=True
-    )
-
-    # Clean up temp file
-    temp_file.unlink(missing_ok=True)
-
-    return result.returncode == 0
+    return (None, validation_history, None)
 
 
 def validate_entry_json(entry: Dict, scripts_dir: Path, chunks_path: str) -> Dict:
-    """Validate entry and return structured JSON result"""
+    """Validate entry and return structured JSON result."""
     import subprocess
 
     # Write entry to temp file
@@ -363,118 +333,23 @@ def validate_entry_json(entry: Dict, scripts_dir: Path, chunks_path: str) -> Dic
         try:
             return json.loads(result.stdout)
         except json.JSONDecodeError:
-            # Fallback if JSON parsing fails
             return {
                 "status": "error",
                 "valid": False,
-                "errors": [{
-                    "type": "VALIDATION_ERROR",
-                    "message": f"Failed to parse validation output: {result.stdout}",
-                    "suggestion": "Check validation script output"
-                }],
+                "errors": [{"type": "VALIDATION_ERROR", "message": f"Failed to parse: {result.stdout}"}],
                 "warnings": []
             }
     else:
-        # No output means validation failed
         return {
             "status": "error",
             "valid": False,
-            "errors": [{
-                "type": "VALIDATION_ERROR",
-                "message": f"Validation script failed: {result.stderr}",
-                "suggestion": "Check validation script errors"
-            }],
+            "errors": [{"type": "VALIDATION_ERROR", "message": f"Script failed: {result.stderr}"}],
             "warnings": []
         }
 
 
-def format_errors_for_ai(errors: List[Dict]) -> str:
-    """Format validation errors for AI consumption"""
-    formatted = []
-    for error in errors:
-        error_type = error.get('type', 'UNKNOWN')
-
-        if error_type == 'BLANK_LINES':
-            formatted.append(
-                f"- ERROR: {error['message']}\n"
-                f"  Fix: {error['suggestion']}"
-            )
-        elif error_type == 'MATH_PRESERVATION':
-            formatted.append(
-                f"- ERROR: {error['message']}\n"
-                f"  Original LaTeX: {error.get('original_math', [])}\n"
-                f"  Your version: {error.get('modified_math', [])}\n"
-                f"  Fix: {error['suggestion']}"
-            )
-        elif error_type == 'LINK_PRESERVATION':
-            formatted.append(
-                f"- ERROR: {error['message']}\n"
-                f"  Original URLs: {error.get('original_links', [])}\n"
-                f"  Your URLs: {error.get('modified_links', [])}\n"
-                f"  Fix: {error['suggestion']}"
-            )
-        elif error_type == 'BLOCK_STRUCTURE':
-            formatted.append(
-                f"- ERROR: {error['message']}\n"
-                f"  Fix: {error['suggestion']}"
-            )
-        else:
-            # Generic error formatting
-            formatted.append(
-                f"- ERROR: {error.get('message', 'Unknown error')}\n"
-                f"  Fix: {error.get('suggestion', 'Please correct this issue')}"
-            )
-
-    return "\n".join(formatted)
-
-
-def create_retry_prompt(chunk: Dict, config: Dict, previous_errors: List[Dict]) -> tuple:
-    """Create prompt for retry with validation error feedback"""
-    error_summary = format_errors_for_ai(previous_errors)
-
-    system_prompt = config['system_prompt'].format(
-        target_language=config['translation']['target_language']
-    )
-
-    user_prompt = f"""Your previous translation had validation errors. Please fix them.
-
-ORIGINAL TEXT:
-{chunk['source_md']}
-
-VALIDATION ERRORS:
-{error_summary}
-
-Please provide a corrected translation that addresses all the errors above.
-Remember:
-- Keep LaTeX formulas EXACTLY as they appear (don't modify $...$ or $$...$$)
-- Keep all URLs and link destinations unchanged
-- Don't add blank lines within the paragraph
-- Don't introduce headings (#), code fences (```), or math fences ($$)
-"""
-
-    return (system_prompt, user_prompt)
-
-
-def source_md_is_safe(text: str) -> bool:
-    """Check if source_md can be included without violating block rules."""
-    if not isinstance(text, str):
-        return False
-    if re.search(r"\n\s*\n", text.replace("\r\n", "\n").strip()):
-        return False
-    heading_line_re = re.compile(r"^\s*#{1,6}\s+")
-    for ln in text.replace("\r\n", "\n").split("\n"):
-        stripped = ln.lstrip()
-        if stripped.startswith("```") or stripped.startswith("~~~"):
-            return False
-        if ln.strip() in ("$$", r"\["):
-            return False
-        if heading_line_re.match(ln):
-            return False
-    return True
-
-
 def append_entry(entry: Dict, output_path: str, chunks_path: str, scripts_dir: Path) -> bool:
-    """Append validated entry to translations.jsonl using append_translation.py"""
+    """Append validated entry to translations.jsonl using append_translation.py."""
     import subprocess
 
     # Write entry to temp file
@@ -484,7 +359,7 @@ def append_entry(entry: Dict, output_path: str, chunks_path: str, scripts_dir: P
     with open(temp_file, 'w', encoding='utf-8') as f:
         json.dump(entry, f, ensure_ascii=False, indent=2)
 
-    # Run append script with correct arguments
+    # Run append script
     append_script = scripts_dir / "append_translation.py"
     result = subprocess.run(
         [sys.executable, str(append_script), "--db", output_path, "--in", str(temp_file), "--chunks", chunks_path],
@@ -511,17 +386,18 @@ async def process_chunk(
     chunks_path: str,
     scripts_dir: Path,
     stats: Dict,
-    max_iterations: int = 3
+    max_iterations: int = 3,
+    guidance_prompt: Optional[str] = None
 ) -> Optional[Dict]:
-    """Process a single chunk with iterative validation-retry loop"""
+    """Process a single chunk with iterative validation-retry loop."""
     try:
         # Check if iterative validation is enabled
         enable_iterative = config.get('translation', {}).get('enable_iterative_validation', True)
 
         if enable_iterative:
-            # New: Iterative translation with validation feedback
-            entry, validation_history = await translate_chunk_with_validation_loop(
-                session, chunk, config, semaphore, chunks_path, scripts_dir, max_iterations
+            # Iterative translation with validation feedback
+            entry, validation_history, parsed = await translate_chunk_with_validation_loop(
+                session, chunk, config, semaphore, chunks_path, scripts_dir, max_iterations, guidance_prompt
             )
 
             if entry is not None:
@@ -548,10 +424,26 @@ async def process_chunk(
                 return None
         else:
             # Old behavior: single-pass translation (backward compatible)
-            entry = await translate_chunk_with_retry(session, chunk, config, semaphore)
+            raw_response = await call_translation_with_retries(session, chunk, config, guidance_prompt=guidance_prompt)
+            parsed = parse_translation_response(raw_response)
+
+            if parsed.translated_md is None:
+                stats['validation_failed'] += 1
+                print(f"Parse failed for {chunk['chunk_id']}", file=sys.stderr)
+                return None
+
+            entry = {
+                "chunk_id": chunk['chunk_id'],
+                "target_md": parsed.translated_md,
+            }
+            if parsed.corrected_source_md:
+                entry["source_md"] = parsed.corrected_source_md
+            elif source_md_is_safe(chunk.get('source_md', '')):
+                entry["source_md"] = chunk['source_md']
 
             # Validate
-            if not validate_entry(entry, scripts_dir, chunks_path):
+            validation_result = validate_entry_json(entry, scripts_dir, chunks_path)
+            if not validation_result['valid']:
                 stats['validation_failed'] += 1
                 print(f"Validation failed for {chunk['chunk_id']}", file=sys.stderr)
                 return None
@@ -582,9 +474,10 @@ async def translate_all_chunks(
     config: Dict,
     output_path: str,
     chunks_path: str,
-    scripts_dir: Path
+    scripts_dir: Path,
+    guidance_prompt: Optional[str] = None
 ) -> Dict:
-    """Translate all chunks with high concurrency"""
+    """Translate all chunks with high concurrency."""
     stats = {
         'success': 0,
         'failed': 0,
@@ -596,19 +489,15 @@ async def translate_all_chunks(
         'failed_chunks': []
     }
 
-    # Get max iterations from config
     max_iterations = config.get('translation', {}).get('max_validation_iterations', 3)
-
     semaphore = asyncio.Semaphore(config['translation']['concurrency'])
 
     async with aiohttp.ClientSession() as session:
-        # Create tasks for all chunks
         tasks = [
-            process_chunk(session, chunk, config, semaphore, output_path, chunks_path, scripts_dir, stats, max_iterations)
+            process_chunk(session, chunk, config, semaphore, output_path, chunks_path, scripts_dir, stats, max_iterations, guidance_prompt)
             for chunk in chunks
         ]
 
-        # Process with progress bar
         print(f"Translating {len(chunks)} chunks with {config['translation']['concurrency']} concurrent requests...")
 
         for coro in tqdm.as_completed(tasks, total=len(tasks), desc="Translating"):
@@ -618,29 +507,13 @@ async def translate_all_chunks(
 
 
 def main():
-    parser = argparse.ArgumentParser(
-        description="High-concurrency translation script for article translator"
-    )
-    parser.add_argument(
-        "--chunks",
-        required=True,
-        help="Path to chunks.jsonl file"
-    )
-    parser.add_argument(
-        "--output",
-        required=True,
-        help="Path to output translations.jsonl file"
-    )
-    parser.add_argument(
-        "--config",
-        required=True,
-        help="Path to config.yaml file"
-    )
-    parser.add_argument(
-        "--resume",
-        action="store_true",
-        help="Skip already-translated chunks (resume mode)"
-    )
+    parser = argparse.ArgumentParser(description="High-concurrency translation script")
+    parser.add_argument("--chunks", required=True, help="Path to chunks.jsonl file")
+    parser.add_argument("--output", required=True, help="Path to output translations.jsonl file")
+    parser.add_argument("--config", required=True, help="Path to config.yaml file")
+    parser.add_argument("--resume", action="store_true", help="Skip already-translated chunks")
+    parser.add_argument("--guidance", help="Guidance prompt from main agent")
+    parser.add_argument("--guidance-file", help="Path to guidance prompt file")
 
     args = parser.parse_args()
 
@@ -671,6 +544,14 @@ def main():
         print("No chunks to translate!")
         sys.exit(0)
 
+    # Read guidance prompt
+    guidance_prompt = None
+    if args.guidance:
+        guidance_prompt = args.guidance
+    elif args.guidance_file:
+        with open(args.guidance_file, 'r', encoding='utf-8') as f:
+            guidance_prompt = f.read().strip()
+
     # Get scripts directory
     scripts_dir = Path(__file__).parent
 
@@ -683,7 +564,8 @@ def main():
             config,
             args.output,
             args.chunks,
-            scripts_dir
+            scripts_dir,
+            guidance_prompt
         ))
     except KeyboardInterrupt:
         print("\nInterrupted by user. Progress has been saved.", file=sys.stderr)
@@ -701,7 +583,6 @@ def main():
     print(f"Total chunks:        {len(chunks_to_translate)}")
     print(f"Successful:          {stats['success']}")
 
-    # Show iteration breakdown if iterative validation is enabled
     if config.get('translation', {}).get('enable_iterative_validation', True):
         print(f"  - 1st attempt:     {stats.get('success_iteration_1', 0)}")
         print(f"  - 2nd attempt:     {stats.get('success_iteration_2', 0)}")
@@ -729,3 +610,12 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+
+
+
+
+
+
+
+

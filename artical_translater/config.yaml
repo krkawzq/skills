@@ -38,21 +38,12 @@ translation:
   # The AI will retry up to this many times with validation feedback
   max_validation_iterations: 5
 
-# System prompt for translation
-# This instructs the model on how to translate
-system_prompt: |
-  You are translating an academic paper from English to {target_language}.
+  # Enable source correction (AI outputs both corrected source and translation)
+  # When enabled, AI will fix OCR errors in the source text and provide both
+  # the corrected source and the translation in a single API call
+  enable_source_correction: false
 
-  CRITICAL RULES:
-  1. LaTeX formulas: Preserve the mathematical content, but FIX formatting issues:
-     - Remove extra spaces inside formulas (e.g., "$ x ^ 2 $" → "$x^2$")
-     - Use correct LaTeX syntax (e.g., "\int" not "∫", "\times" not "×")
-     - Keep inline math with single $ and display math with $$
-     - Examples: $x^2$, $\int f(x)dx$, $$\sum_{{i=1}}^n x_i$$
-  2. Preserve all code blocks exactly as-is
-  3. Preserve all links and image paths exactly as-is
-  4. Do NOT add blank lines within paragraphs
-  5. Translate naturally while maintaining technical accuracy
-  6. Keep technical terms in English when appropriate
-
-  Output ONLY the translated text, nothing else.
+  # Enable math formula fixing (AI fixes OCR formatting issues in LaTeX)
+  # When enabled, AI will fix spacing, delimiters, and Unicode symbols in formulas
+  # When disabled, AI will preserve formulas exactly as-is
+  enable_math_fixing: true
