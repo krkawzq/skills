@@ -73,11 +73,14 @@ translation:
   enable_iterative_validation: true
   max_validation_iterations: 3
 
-system_prompt: |
-  ...（翻译规则）...
+  # 新增特性开关
+  enable_source_correction: false  # AI 同时输出校准原文和翻译
+  enable_math_fixing: true         # AI 修复 OCR 公式格式问题
 ```
 
 **API Key 优先级**：若设置 `OPENAI_API_KEY`，会覆盖 `config.yaml` 中的 `api_key`。
+
+**注意**：系统提示词已硬编码在 `scripts/prompts.py` 中，不再需要在 config.yaml 中配置。
 
 ---
 
@@ -115,6 +118,30 @@ python scripts/translate_concurrent.py \
 - 自动重试（`max_retries`, `retry_delay`）
 - 逐条验证并追加（内部调用 `check_translation_entry.py` 与 `append_translation.py`）
 - 支持 `--resume` 跳过已完成条目
+- **结构化 AI 输出**：AI 输出分析、翻译（在 ```markdown translated``` 块中）、元信息（难度、置信度等）
+- **CHECKER_BYPASS 机制**：AI 可声明 checker 误报，系统自动 sanitize 后接受
+
+**带主 agent 指导的翻译**（推荐用于复杂论文）：
+```bash
+# 直接传入指导文本
+python scripts/translate_concurrent.py \
+  --chunks work/chunks.jsonl \
+  --output work/translations.jsonl \
+  --config config.yaml \
+  --guidance "本文是关于深度学习的论文，注意术语：attention→注意力机制，transformer→变换器"
+
+# 从文件读取指导文本（适合长文本）
+python scripts/translate_concurrent.py \
+  --chunks work/chunks.jsonl \
+  --output work/translations.jsonl \
+  --config config.yaml \
+  --guidance-file work/guidance.txt
+```
+主 agent 可在 guidance 中传递：
+- 论文摘要分析
+- 领域术语表
+- 翻译风格要求
+- 特殊处理说明
 
 ### 3.5 进度监控
 ```bash
@@ -201,15 +228,32 @@ python scripts/handle_failed_chunks.py \
 
 ## 7) 其他工具（按需）
 
-- 列出标题：  
+- **公式标准化工具**（处理 OCR 公式格式问题）：
+  ```bash
+  # 处理完整 Markdown 文件（仅规则引擎，无 API 调用）
+  python scripts/normalize_math.py --input paper.md --output paper.fixed.md
+
+  # 处理 chunks JSONL（仅规则引擎）
+  python scripts/normalize_math.py --chunks work/chunks.jsonl --output work/chunks.fixed.jsonl
+
+  # 处理 chunks JSONL（规则 + AI 引擎，需要 API）
+  python scripts/normalize_math.py \
+    --chunks work/chunks.jsonl \
+    --output work/chunks.fixed.jsonl \
+    --config config.yaml --ai --concurrency 50
+  ```
+  规则引擎修复：Unicode → LaTeX 映射（∫→\int, ×→\times 等）、公式内空格、下标/上标空格
+  AI 引擎修复：复杂 OCR 错误（需要 `--ai` 标志）
+
+- 列出标题：
   ```bash
   python scripts/list_headings.py -p paper.md
   ```
-- 提取章节：  
+- 提取章节：
   ```bash
   python scripts/extract_section.py -p paper.md --index 3 > section.md
   ```
-- 导出对齐双文件：  
+- 导出对齐双文件：
   ```bash
   python scripts/export_aligned_pair.py \
     -p paper.md \
@@ -218,7 +262,7 @@ python scripts/handle_failed_chunks.py \
     --out-target paper.zh.md \
     --prefer-corrected-source
   ```
-- 合并对齐双文件为双语：  
+- 合并对齐双文件为双语：
   ```bash
   python scripts/merge_aligned_bilingual.py \
     --source paper.en.md \
@@ -228,7 +272,52 @@ python scripts/handle_failed_chunks.py \
 
 ---
 
-## 8) 关键规则（必须遵守）
+## 8) 新架构特性（v2.0 重构）
+
+### 8.1 结构化 AI 输出
+AI 翻译器现在输出结构化格式，包含：
+- **Step 1: Analysis** - 翻译前分析（内容类型、棘手元素、潜在问题）
+- **Step 2: Translation** - 翻译内容（在 ```markdown translated``` 代码块中）
+- **Step 2b: Source Correction** - 原文校准（条件性，在 ```markdown corrected``` 代码块中）
+- **Step 3: Meta-info** - 元信息字段：
+  - `DIFFICULTY`: easy/medium/hard
+  - `CONFIDENCE`: high/medium/low
+  - `POTENTIAL_ISSUES`: 预估问题
+  - `CHECKER_BYPASS`: AI 声明 checker 误报的说明
+  - `NOTES`: 翻译选择说明
+
+### 8.2 CHECKER_BYPASS 机制
+当 AI 认为验证器误报时，可在 `CHECKER_BYPASS` 字段中说明原因。系统会：
+1. 尝试 `sanitize_target_md()` 修复常见格式问题
+2. 重新验证，若通过则接受
+3. 若仍失败，标记为需人工审查但不再重试
+
+这减少了无效重试，提高了效率。
+
+### 8.3 原文校准功能
+当 `enable_source_correction: true` 时，AI 同时输出：
+- 校准后的原文（修复 OCR 错误）
+- 基于校准原文的翻译
+
+一轮 API 调用完成两项工作，更高效。
+
+### 8.4 公式格式修复
+当 `enable_math_fixing: true` 时，AI 修复 OCR 公式问题：
+- 移除多余空格：`$ x ^ 2 $` → `$x^2$`
+- 修复下标/上标：`\int _ { 0 } ^ { 1 }` → `\int_{0}^{1}`
+- Unicode → LaTeX：`∫` → `\int`, `×` → `\times`
+- 保留数学内容，只修复格式
+
+### 8.5 模块化架构
+新架构将代码分为 4 个核心模块：
+- **scripts/shared.py** - 共享工具函数（消除重复代码）
+- **scripts/prompts.py** - 硬编码提示词（避免 .format() 与 LaTeX 冲突）
+- **scripts/response_parser.py** - 结构化输出解析器
+- **scripts/normalize_math.py** - 公式标准化工具（规则 + AI 双层）
+
+---
+
+## 9) 关键规则（必须遵守）
 
 1. **一条 chunk = 一段正文**，禁止空行分割  
 2. **不引入结构符号**：`#` 标题、``` 代码围栏、`$$` 数学围栏  
@@ -237,7 +326,7 @@ python scripts/handle_failed_chunks.py \
 
 ---
 
-## 9) 常见问题
+## 10) 常见问题
 
 **Q: API key 报错**  
 A: 设置 `OPENAI_API_KEY` 或在 `config.yaml` 中填写 `api_key`。
@@ -250,7 +339,7 @@ A: 删除段内空行，禁止新增 `#`、```、`$$`。
 
 ---
 
-## 10) 推荐清单
+## 11) 推荐清单
 
 开始前：
 - [ ] `pip install -r requirements.txt`
